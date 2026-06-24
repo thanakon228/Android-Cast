@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# เครื่องมือที่โหลดอัตโนมัติ (ไม่ต้องเก็บใน repo)
+tools/
+
+# ค่าที่สร้างตอนใช้งาน
+settings.json
