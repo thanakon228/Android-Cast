@@ -126,7 +126,7 @@ class ConnectionSupervisor(QThread):
       - ถ้า scrcpy ปิดและอุปกรณ์หายไป = หลุดจริง -> เชื่อมต่อใหม่ (มี backoff) แล้วเปิดมิเรอร์ใหม่
     """
     status = pyqtSignal(str, str)   # (state, message); state: live|reconnecting|stopped|gaveup
-    embedded = pyqtSignal(int)      # HWND ของหน้าต่าง scrcpy หลังฝังสำเร็จ
+    embed_ready = pyqtSignal(int)   # เจอ HWND ของ scrcpy แล้ว -> ให้ main thread ฝัง
 
     MAX_ATTEMPTS = 40
     POLL_SEC = 1.5
@@ -205,10 +205,23 @@ class ConnectionSupervisor(QThread):
             self._stop.set()
 
     def _do_embed(self):
-        """รอหน้าต่าง scrcpy โผล่แล้วฝังเข้า parent (ทดลอง)"""
-        hwnd = win_embed.wait_for_window(self.title, timeout=6.0)
-        if hwnd and win_embed.embed(hwnd, self.parent_hwnd):
-            self.embedded.emit(hwnd)
+        """รอหน้าต่าง scrcpy โผล่ แล้วส่ง HWND ให้ main thread เป็นคนฝัง"""
+        proc = self.proc
+        pid = proc.pid if proc else 0
+        self._log(f"🖼️ กำลังรอหน้าต่าง scrcpy เพื่อฝัง (pid={pid})...")
+        hwnd = win_embed.wait_for_window(pid, self.title, timeout=10.0)
+        if hwnd:
+            self._log(f"🖼️ เจอหน้าต่าง scrcpy (hwnd={hwnd}) — กำลังฝัง...")
+            self.embed_ready.emit(hwnd)
+        else:
+            self._log("⚠️ หาหน้าต่าง scrcpy ไม่เจอใน 10 วิ — แสดงเป็นหน้าต่างแยกแทน")
+
+    def _log(self, msg: str):
+        if getattr(self.mgr, "logger", None):
+            try:
+                self.mgr.logger(msg)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _device_connected(self) -> bool:
         try:
@@ -913,7 +926,7 @@ class MainWindow(QWidget):
 
         self.supervisor = ConnectionSupervisor(self.mgr, target, title, extra, parent_hwnd)
         self.supervisor.status.connect(self._on_session_status)
-        self.supervisor.embedded.connect(self._on_embedded)
+        self.supervisor.embed_ready.connect(self._on_embed_ready)
         self.supervisor.finished.connect(self._on_session_finished)
         self.supervisor.start()
         self.live_bar.show()
@@ -944,10 +957,16 @@ class MainWindow(QWidget):
                   busy_msg="กำลังแคปหน้าจอ...")
 
     # ----------------------------------------------------------------- embed
-    def _on_embedded(self, hwnd: int):
-        self.embedded_hwnd = hwnd
-        self._resize_embedded()
-        self._log("🖼️ ฝังหน้าจอมือถือในแอปแล้ว")
+    def _on_embed_ready(self, hwnd: int):
+        """เรียกบน main thread — ทำ SetParent ที่นี่ (thread เจ้าของ parent)"""
+        parent = int(self.embed_area.winId())
+        if win_embed.embed(hwnd, parent):
+            self.embedded_hwnd = hwnd
+            self._resize_embedded()
+            self._log("✅ ฝังหน้าจอมือถือในแอปแล้ว")
+        else:
+            self._log("❌ ฝังหน้าจอไม่สำเร็จ (SetParent ล้มเหลว) — ใช้หน้าต่างแยกแทน")
+            self.embed_area.hide()
 
     def _resize_embedded(self):
         if self.embedded_hwnd and self.embed_area.isVisible():
