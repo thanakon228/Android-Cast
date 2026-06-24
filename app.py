@@ -19,11 +19,13 @@ import sys
 import threading
 import time
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
-from PyQt6.QtGui import QPixmap, QImage, QFont
+from datetime import datetime
+
+from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, QSize
+from PyQt6.QtGui import QPixmap, QImage, QFont, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
-    QLineEdit, QStackedWidget, QFrame, QProgressBar, QMessageBox, QSizePolicy,
+    QLineEdit, QStackedWidget, QFrame, QProgressBar, QMessageBox, QPlainTextEdit,
 )
 
 import qrcode
@@ -40,6 +42,11 @@ MIRROR_EXTRA = ["--video-bit-rate", "8M", "--max-fps", "60"]
 # ---------------------------------------------------------------------------
 # Worker thread กลาง — รันงาน blocking โดยไม่ค้าง UI
 # ---------------------------------------------------------------------------
+class LogBus(QObject):
+    """ตัวกลางส่งข้อความ log จากเธรดไหนก็ได้เข้า console บน main thread อย่างปลอดภัย"""
+    line = pyqtSignal(str)
+
+
 class Worker(QThread):
     done = pyqtSignal(object)        # ส่งผลลัพธ์
     failed = pyqtSignal(str)         # ส่งข้อความ error
@@ -218,6 +225,16 @@ QPushButton#stop {
     padding: 8px 16px; font-size: 13px; font-weight: 700;
 }
 QPushButton#stop:hover { background: #3a2326; border: 1px solid #fe2c55; }
+QPushButton#linkBtn {
+    background: transparent; border: none; color: #9aa0a6;
+    font-size: 12px; font-weight: 600; padding: 2px 6px;
+}
+QPushButton#linkBtn:hover { color: #ffffff; }
+QPlainTextEdit#console {
+    background: #08080a; border: 1px solid #26262b; border-radius: 10px;
+    color: #c8e6c9; font-family: 'Cascadia Mono','Consolas',monospace; font-size: 12px;
+    padding: 8px;
+}
 """
 
 
@@ -244,6 +261,11 @@ class MainWindow(QWidget):
         self.settings = load_settings()
         self.worker: Worker | None = None
         self.supervisor: ConnectionSupervisor | None = None
+
+        # console log bus (ส่ง log จาก adb/scrcpy/เธรดต่าง ๆ เข้าหน้าจอ)
+        self.bus = LogBus()
+        self.bus.line.connect(self._append_console)
+        self.mgr.logger = self.bus.line.emit
 
         self.setObjectName("root")
         self.setWindowTitle(APP_NAME)
@@ -331,6 +353,35 @@ class MainWindow(QWidget):
         self.log.setObjectName("hint")
         self.log.setWordWrap(True)
         root.addWidget(self.log)
+
+        # ---- console (ฝังในตัวโปรแกรม) ----
+        con_head = QHBoxLayout()
+        con_head.setSpacing(4)
+        con_title = QLabel("🖥️ Console")
+        con_title.setObjectName("sectionTitle")
+        self.btn_con_toggle = QPushButton("ซ่อน ▾")
+        self.btn_con_toggle.setObjectName("linkBtn")
+        self.btn_con_toggle.clicked.connect(self._toggle_console)
+        btn_con_clear = QPushButton("ล้าง")
+        btn_con_clear.setObjectName("linkBtn")
+        btn_con_clear.clicked.connect(lambda: self.console.clear())
+        btn_con_copy = QPushButton("คัดลอก")
+        btn_con_copy.setObjectName("linkBtn")
+        btn_con_copy.clicked.connect(self._copy_console)
+        con_head.addWidget(con_title)
+        con_head.addStretch(1)
+        con_head.addWidget(btn_con_copy)
+        con_head.addWidget(btn_con_clear)
+        con_head.addWidget(self.btn_con_toggle)
+        root.addLayout(con_head)
+
+        self.console = QPlainTextEdit()
+        self.console.setObjectName("console")
+        self.console.setReadOnly(True)
+        self.console.setMaximumBlockCount(2000)   # กันบวมไม่จำกัด
+        self.console.setFixedHeight(150)
+        root.addWidget(self.console)
+        self._log("พร้อมใช้งาน — log จะแสดงที่นี่")
 
     def _card(self) -> tuple[QFrame, QVBoxLayout]:
         card = QFrame()
@@ -455,6 +506,32 @@ class MainWindow(QWidget):
         box.setText(msg)
         box.exec()
 
+    # ------------------------------------------------------------- console
+    def _log(self, msg: str):
+        """ส่งข้อความเข้า console (เรียกจาก main thread); เธรดอื่นให้ใช้ self.bus.line.emit"""
+        self.bus.line.emit(msg)
+
+    def _append_console(self, text: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        for i, ln in enumerate(text.split("\n")):
+            prefix = ts if i == 0 else "        "
+            self.console.appendPlainText(f"{prefix}  {ln}")
+        self.console.moveCursor(QTextCursor.MoveOperation.End)
+        sb = self.console.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _toggle_console(self):
+        if self.console.isVisible():
+            self.console.hide()
+            self.btn_con_toggle.setText("แสดง ▸")
+        else:
+            self.console.show()
+            self.btn_con_toggle.setText("ซ่อน ▾")
+
+    def _copy_console(self):
+        QApplication.clipboard().setText(self.console.toPlainText())
+        self.log.setText("คัดลอก log แล้ว")
+
     def _run(self, fn, *args, on_done=None, busy_msg="กำลังทำงาน...", **kwargs):
         """เรียกงาน blocking ใน worker thread"""
         self._set_busy(True, busy_msg)
@@ -470,6 +547,7 @@ class MainWindow(QWidget):
         self._set_busy(False)
         self.progress.hide()
         self._refresh_status()
+        self._log("❌ " + msg)
         self._toast("เกิดข้อผิดพลาด", msg, QMessageBox.Icon.Warning)
 
     def _on_progress(self, msg: str, pct: int):
@@ -479,6 +557,7 @@ class MainWindow(QWidget):
 
     # ------------------------------------------------------------- tool setup
     def _download_tools(self):
+        self._log("ยังไม่มี scrcpy — กำลังดาวน์โหลดอัตโนมัติ...")
         self.progress.show()
         self.worker = Worker(self.mgr.ensure_tools, self._emit_progress)
         self.worker.done.connect(self._tools_ready)
@@ -494,6 +573,7 @@ class MainWindow(QWidget):
         self.progress.hide()
         self.mgr.start_server()
         self._refresh_status()
+        self._log("✅ scrcpy + adb พร้อมใช้งาน")
         self._set_busy(False, "พร้อมใช้งานแล้ว — เลือกวิธีเชื่อมต่อด้านบน")
 
     # ------------------------------------------------------------------- WiFi
@@ -585,6 +665,7 @@ class MainWindow(QWidget):
 
     def _on_session_status(self, state: str, message: str):
         self.live_text.setText(message)
+        self._log(message)
         if state == "live":
             self.live_bar.setStyleSheet("")            # ใช้ธีมเขียวปกติ
             self.btn_stop.setEnabled(True)

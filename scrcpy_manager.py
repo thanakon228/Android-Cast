@@ -16,6 +16,7 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,7 +60,16 @@ class ScrcpyManager:
     def __init__(self) -> None:
         self.scrcpy_path: Optional[Path] = None
         self.adb_path: Optional[Path] = None
+        # callback รับข้อความ log (set จากภายนอก) — ต้อง thread-safe ฝั่งผู้รับ
+        self.logger: Optional[Callable[[str], None]] = None
         self._locate_existing()
+
+    def _log(self, msg: str) -> None:
+        if self.logger:
+            try:
+                self.logger(msg)
+            except Exception:  # noqa: BLE001
+                pass
 
     # ------------------------------------------------------------------ setup
     def _locate_existing(self) -> None:
@@ -135,14 +145,23 @@ class ScrcpyManager:
         report("พร้อมใช้งาน", 100)
 
     # ------------------------------------------------------------------- adb
-    def _adb(self, *args: str, timeout: int = 30) -> subprocess.CompletedProcess:
+    def _adb(self, *args: str, timeout: int = 30,
+             log: bool = False) -> subprocess.CompletedProcess:
         if not self.adb_path:
             raise ToolError("ยังไม่มี adb")
-        return subprocess.run(
+        if log:
+            self._log("$ adb " + " ".join(args))
+        cp = subprocess.run(
             [str(self.adb_path), *args],
             capture_output=True, text=True, timeout=timeout,
+            encoding="utf-8", errors="replace",
             creationflags=_CREATE_NO_WINDOW,
         )
+        if log:
+            out = (cp.stdout + cp.stderr).strip()
+            if out:
+                self._log("  " + out.replace("\n", "\n  "))
+        return cp
 
     def start_server(self) -> None:
         self._adb("start-server", timeout=20)
@@ -169,21 +188,21 @@ class ScrcpyManager:
 
     def pair(self, host_port: str, code: str) -> str:
         """จับคู่แบบไร้สาย (Android 11+) ด้วย IP:PORT + รหัส 6 หลัก"""
-        cp = self._adb("pair", host_port, code, timeout=30)
+        cp = self._adb("pair", host_port, code, timeout=30, log=True)
         out = (cp.stdout + cp.stderr).strip()
         if "Successfully paired" not in out:
             raise ToolError(out or "จับคู่ไม่สำเร็จ")
         return out
 
     def connect(self, host_port: str) -> str:
-        cp = self._adb("connect", host_port, timeout=20)
+        cp = self._adb("connect", host_port, timeout=20, log=True)
         out = (cp.stdout + cp.stderr).strip()
         if "connected" not in out.lower():
             raise ToolError(out or "เชื่อมต่อไม่สำเร็จ")
         return out
 
     def disconnect(self, host_port: Optional[str] = None) -> None:
-        self._adb("disconnect", *( [host_port] if host_port else [] ), timeout=15)
+        self._adb("disconnect", *( [host_port] if host_port else [] ), timeout=15, log=True)
 
     def mdns_connect_target(self) -> Optional[str]:
         """ค้นหาพอร์ตเชื่อมต่อไร้สายอัตโนมัติผ่าน mDNS (หลังจาก pair สำเร็จ)"""
@@ -197,7 +216,7 @@ class ScrcpyManager:
 
     def enable_tcpip(self, serial: str, port: int = 5555) -> None:
         """สั่งให้อุปกรณ์ USB เปิดโหมด adb-over-wifi"""
-        cp = self._adb("-s", serial, "tcpip", str(port), timeout=20)
+        cp = self._adb("-s", serial, "tcpip", str(port), timeout=20, log=True)
         out = (cp.stdout + cp.stderr).lower()
         if "error" in out:
             raise ToolError(cp.stdout + cp.stderr)
@@ -230,7 +249,30 @@ class ScrcpyManager:
         # ให้ scrcpy หา adb ตัวเดียวกับเรา
         if self.adb_path:
             env["ADB"] = str(self.adb_path)
-        return subprocess.Popen(args, env=env)
+
+        self._log(f"$ scrcpy -s {serial}")
+        # ถ้ามี logger -> ดึง output ของ scrcpy เข้า console (ต้อง drain ไม่งั้น buffer ตัน)
+        if self.logger:
+            proc = subprocess.Popen(
+                args, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+            threading.Thread(target=self._pump_output, args=(proc,), daemon=True).start()
+            return proc
+        return subprocess.Popen(args, env=env, creationflags=_CREATE_NO_WINDOW)
+
+    def _pump_output(self, proc: subprocess.Popen) -> None:
+        """อ่าน output ของ scrcpy ทีละบรรทัดส่งเข้า logger"""
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    self._log("[scrcpy] " + line)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ------------------------------------------------------------------ helpers
