@@ -23,7 +23,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, QSize
+from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, QSize, QTimer
 from PyQt6.QtGui import QPixmap, QImage, QFont, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
@@ -940,6 +940,7 @@ class MainWindow(QWidget):
         self.supervisor = None
         self.live_bar.hide()
         self.embed_area.hide()
+        self.stack.show()
         self.embedded_hwnd = 0
         self.current_target = None
         self.btn_shot.setEnabled(False)
@@ -962,7 +963,13 @@ class MainWindow(QWidget):
         parent = int(self.embed_area.winId())
         if win_embed.embed(hwnd, parent):
             self.embedded_hwnd = hwnd
+            # ซ่อนแท็บเพื่อให้จอมือถือเต็มพื้นที่
+            self.stack.hide()
+            self.embed_area.show()
             self._resize_embedded()
+            # รีไซส์ซ้ำหลัง layout นิ่ง (กันกรณีขนาดยังไม่อัปเดต)
+            for delay in (120, 350, 700):
+                QTimer.singleShot(delay, self._resize_embedded)
             self._log("✅ ฝังหน้าจอมือถือในแอปแล้ว")
         else:
             self._log("❌ ฝังหน้าจอไม่สำเร็จ (SetParent ล้มเหลว) — ใช้หน้าต่างแยกแทน")
@@ -995,6 +1002,7 @@ class MainWindow(QWidget):
         self.live_bar.hide()
         self.live_bar.setStyleSheet("")
         self.embed_area.hide()
+        self.stack.show()
         self.embedded_hwnd = 0
         self.btn_shot.setEnabled(False)
         self.current_target = None
