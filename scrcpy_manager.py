@@ -206,13 +206,47 @@ class ScrcpyManager:
 
     def mdns_connect_target(self) -> Optional[str]:
         """ค้นหาพอร์ตเชื่อมต่อไร้สายอัตโนมัติผ่าน mDNS (หลังจาก pair สำเร็จ)"""
-        cp = self._adb("mdns", "services", timeout=10)
-        for line in cp.stdout.splitlines():
-            if "_adb-tls-connect" in line:
-                m = re.search(r"(\d+\.\d+\.\d+\.\d+):(\d+)", line)
-                if m:
-                    return f"{m.group(1)}:{m.group(2)}"
+        for kind, hostport in self.discover():
+            if kind == "connect":
+                return hostport
         return None
+
+    def discover(self) -> list[tuple[str, str]]:
+        """
+        ค้นหาอุปกรณ์ในวง WiFi ผ่าน mDNS ที่ adb มีในตัว
+        คืน list ของ (kind, 'ip:port') โดย kind = 'connect' หรือ 'pairing'
+        """
+        cp = self._adb("mdns", "services", timeout=10)
+        found: list[tuple[str, str]] = []
+        for line in cp.stdout.splitlines():
+            m = re.search(r"_adb-tls-(connect|pairing).*?(\d+\.\d+\.\d+\.\d+:\d+)", line)
+            if m:
+                found.append((m.group(1), m.group(2)))
+        # ตัดซ้ำแต่คงลำดับ
+        seen, uniq = set(), []
+        for item in found:
+            if item not in seen:
+                seen.add(item)
+                uniq.append(item)
+        return uniq
+
+    def screenshot(self, serial: str, out_path: "Path") -> "Path":
+        """ถ่ายภาพหน้าจอมือถือเป็น PNG (ใช้ adb exec-out screencap — binary-safe)"""
+        if not self.adb_path:
+            raise ToolError("ยังไม่มี adb")
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "wb") as f:
+            cp = subprocess.run(
+                [str(self.adb_path), "-s", serial, "exec-out", "screencap", "-p"],
+                stdout=f, stderr=subprocess.PIPE, timeout=20,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+        if cp.returncode != 0 or out_path.stat().st_size == 0:
+            err = cp.stderr.decode("utf-8", "replace").strip() if cp.stderr else ""
+            raise ToolError(err or "ถ่ายภาพหน้าจอไม่สำเร็จ")
+        self._log(f"📸 บันทึกภาพ: {out_path}")
+        return out_path
 
     def enable_tcpip(self, serial: str, port: int = 5555) -> None:
         """สั่งให้อุปกรณ์ USB เปิดโหมด adb-over-wifi"""

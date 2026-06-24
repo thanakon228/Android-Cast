@@ -9,3 +9,12 @@ tools/
 
 # ค่าที่สร้างตอนใช้งาน
 settings.json
+
+# ไฟล์ที่ผู้ใช้สร้าง
+recordings/
+screenshots/
+
+# ผลลัพธ์ build .exe
+build/
+dist/
+*.spec
