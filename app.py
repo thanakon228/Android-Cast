@@ -16,8 +16,8 @@ ScreenCast Studio
 from __future__ import annotations
 
 import sys
-from dataclasses import asdict
-from pathlib import Path
+import threading
+import time
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
 from PyQt6.QtGui import QPixmap, QImage, QFont
@@ -32,6 +32,9 @@ from scrcpy_manager import ScrcpyManager, ToolError, local_ip
 from settings_store import load_settings, save_settings
 
 APP_NAME = "ScreenCast Studio"
+
+# พารามิเตอร์ส่งให้ scrcpy ตอนเปิดมิเรอร์ (ปรับความลื่น/คุณภาพได้ที่นี่)
+MIRROR_EXTRA = ["--video-bit-rate", "8M", "--max-fps", "60"]
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +57,117 @@ class Worker(QThread):
             self.done.emit(result)
         except Exception as e:  # noqa: BLE001
             self.failed.emit(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Supervisor — เฝ้าการเชื่อมต่อ + ต่อใหม่อัตโนมัติเมื่อหลุด
+# ---------------------------------------------------------------------------
+class ConnectionSupervisor(QThread):
+    """
+    เปิดหน้าต่างมิเรอร์แล้วเฝ้าไว้:
+      - ถ้า scrcpy ปิดเองแต่ adb ยังเห็นอุปกรณ์ = ผู้ใช้ปิดหน้าต่างเอง -> หยุด
+      - ถ้า scrcpy ปิดและอุปกรณ์หายไป = หลุดจริง -> เชื่อมต่อใหม่ (มี backoff) แล้วเปิดมิเรอร์ใหม่
+    """
+    status = pyqtSignal(str, str)   # (state, message); state: live|reconnecting|stopped|gaveup
+
+    MAX_ATTEMPTS = 40
+    POLL_SEC = 1.5
+    MIN_LIVE_SEC = 3.0   # ถ้าหน้าต่างอยู่ได้นานกว่านี้แล้วถูกปิดทั้งที่อุปกรณ์ยังต่ออยู่ = ผู้ใช้ปิดเอง
+
+    def __init__(self, mgr, target: str, title: str, extra: list[str]):
+        super().__init__()
+        self.mgr = mgr
+        self.target = target
+        self.title = title
+        self.extra = extra
+        self.proc = None
+        self._launched_at = 0.0
+        self._stop = threading.Event()
+
+    # -- ควบคุมจากภายนอก -------------------------------------------------
+    def stop(self):
+        """ผู้ใช้สั่งหยุด session"""
+        self._stop.set()
+        self._kill_proc()
+
+    # -- ลูปหลัก ---------------------------------------------------------
+    def run(self):
+        self._launch()
+        attempts = 0
+        while not self._stop.is_set():
+            if self._stop.wait(self.POLL_SEC):
+                break
+
+            if self.proc and self.proc.poll() is None:
+                attempts = 0            # ยังแคสอยู่ปกติ
+                continue
+
+            # scrcpy ปิดไปแล้ว — แยกแยะสาเหตุ
+            lived = time.monotonic() - self._launched_at
+            connected = self._device_connected()
+
+            if connected and lived >= self.MIN_LIVE_SEC:
+                # อุปกรณ์ยังต่ออยู่ + เปิดมานานพอ = ผู้ใช้ปิดหน้าต่างเอง
+                self.status.emit("stopped", "ปิดหน้าต่างมิเรอร์แล้ว — หยุดแคส")
+                break
+
+            attempts += 1
+            if attempts > self.MAX_ATTEMPTS:
+                self.status.emit("gaveup", "🔴 เชื่อมต่อใหม่ไม่สำเร็จหลายครั้ง — หยุดแล้ว")
+                break
+
+            if connected:
+                # อุปกรณ์ยังอยู่แต่ scrcpy ปิดเร็วผิดปกติ → แค่เปิดมิเรอร์ใหม่
+                self.status.emit("reconnecting", f"⚠️ มิเรอร์หลุด — กำลังเปิดใหม่ (ครั้งที่ {attempts})...")
+                self._launch()
+            else:
+                # หลุดจริง → ต่อ adb ใหม่ก่อน
+                self.status.emit(
+                    "reconnecting",
+                    f"🔴 หลุด — กำลังเชื่อมต่อใหม่ ครั้งที่ {attempts}/{self.MAX_ATTEMPTS}...",
+                )
+                if self._try_reconnect():
+                    self._launch()
+                else:
+                    # backoff แบบค่อย ๆ ถี่ห่างขึ้น (สูงสุด ~12 วิ)
+                    self._stop.wait(min(2 + attempts, 12))
+
+    # -- ภายใน -----------------------------------------------------------
+    def _launch(self):
+        try:
+            self.proc = self.mgr.mirror(self.target, title=self.title, extra=self.extra)
+            self._launched_at = time.monotonic()
+            self.status.emit("live", f"🟢 กำลังแคส {self.target}")
+        except Exception as e:  # noqa: BLE001
+            self.status.emit("gaveup", f"เปิดมิเรอร์ไม่สำเร็จ: {e}")
+            self._stop.set()
+
+    def _device_connected(self) -> bool:
+        try:
+            return any(
+                d.serial == self.target and d.state == "device"
+                for d in self.mgr.list_devices()
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _try_reconnect(self) -> bool:
+        try:
+            self.mgr.disconnect(self.target)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.mgr.connect(self.target)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _kill_proc(self):
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +209,15 @@ QProgressBar {
     background: #232328; border: none; border-radius: 6px; height: 8px; text-align: center;
 }
 QProgressBar::chunk { background: #fe2c55; border-radius: 6px; }
+QFrame#liveBar {
+    background: #14241b; border: 1px solid #1f5138; border-radius: 12px;
+}
+QLabel#liveText { font-size: 13px; font-weight: 600; }
+QPushButton#stop {
+    background: #2a2a30; border: 1px solid #44444c; border-radius: 9px;
+    padding: 8px 16px; font-size: 13px; font-weight: 700;
+}
+QPushButton#stop:hover { background: #3a2326; border: 1px solid #fe2c55; }
 """
 
 
@@ -120,7 +243,7 @@ class MainWindow(QWidget):
         self.mgr = ScrcpyManager()
         self.settings = load_settings()
         self.worker: Worker | None = None
-        self.mirror_proc = None
+        self.supervisor: ConnectionSupervisor | None = None
 
         self.setObjectName("root")
         self.setWindowTitle(APP_NAME)
@@ -186,6 +309,22 @@ class MainWindow(QWidget):
         self.stack.addWidget(self._build_wifi_page())
         self.stack.addWidget(self._build_usb_page())
         root.addWidget(self.stack, 1)
+
+        # live bar (โผล่เฉพาะตอนกำลังแคส)
+        self.live_bar = QFrame()
+        self.live_bar.setObjectName("liveBar")
+        lb = QHBoxLayout(self.live_bar)
+        lb.setContentsMargins(14, 10, 12, 10)
+        self.live_text = QLabel("")
+        self.live_text.setObjectName("liveText")
+        self.live_text.setWordWrap(True)
+        self.btn_stop = QPushButton("หยุดแคส")
+        self.btn_stop.setObjectName("stop")
+        self.btn_stop.clicked.connect(self._stop_session)
+        lb.addWidget(self.live_text, 1)
+        lb.addWidget(self.btn_stop)
+        self.live_bar.hide()
+        root.addWidget(self.live_bar)
 
         # log line
         self.log = QLabel("")
@@ -387,7 +526,7 @@ class MainWindow(QWidget):
         self.settings["last_wifi_target"] = target
         save_settings(self.settings)
         self.log.setText(f"เชื่อมต่อสำเร็จ: {target} — กำลังเปิดหน้าจอ...")
-        self._launch_mirror(target)
+        self._start_session(target)
 
     # -------------------------------------------------------------------- USB
     def _usb_scan(self):
@@ -425,21 +564,44 @@ class MainWindow(QWidget):
 
         self._run(task, on_done=self._after_connect, busy_msg="กำลังเปิดโหมดไร้สาย...")
 
-    # ----------------------------------------------------------------- mirror
-    def _launch_mirror(self, target: str):
-        try:
-            title = f"{APP_NAME} — {target}"
-            self.mirror_proc = self.mgr.mirror(
-                target, title=title,
-                extra=["--video-bit-rate", "8M", "--max-fps", "60"],
+    # ------------------------------------------------------- mirror session
+    def _start_session(self, target: str):
+        """เริ่มแคส + เปิด supervisor ที่จะต่อใหม่อัตโนมัติเมื่อหลุด"""
+        self._stop_session()  # เคลียร์ session เก่า (ถ้ามี)
+        title = f"{APP_NAME} — {target}"
+        self.supervisor = ConnectionSupervisor(self.mgr, target, title, MIRROR_EXTRA)
+        self.supervisor.status.connect(self._on_session_status)
+        self.supervisor.finished.connect(self._on_session_finished)
+        self.supervisor.start()
+        self.live_bar.show()
+
+    def _stop_session(self):
+        sup = self.supervisor
+        if sup and sup.isRunning():
+            sup.stop()
+            sup.wait(4000)
+        self.supervisor = None
+        self.live_bar.hide()
+
+    def _on_session_status(self, state: str, message: str):
+        self.live_text.setText(message)
+        if state == "live":
+            self.live_bar.setStyleSheet("")            # ใช้ธีมเขียวปกติ
+            self.btn_stop.setEnabled(True)
+        elif state == "reconnecting":
+            self.live_bar.setStyleSheet(
+                "QFrame#liveBar{background:#2a1418;border:1px solid #fe2c55;border-radius:12px;}"
             )
-            self.log.setText(f"🟢 กำลังแคส {target} (ปิดหน้าต่างมิเรอร์เพื่อหยุด)")
-        except ToolError as e:
-            self._toast("เปิดมิเรอร์ไม่สำเร็จ", str(e), QMessageBox.Icon.Warning)
+        elif state in ("stopped", "gaveup"):
+            self.log.setText(message)
+
+    def _on_session_finished(self):
+        # supervisor จบลูปแล้ว (ผู้ใช้ปิดหน้าต่าง / ยอมแพ้ / สั่งหยุด)
+        self.live_bar.hide()
+        self.live_bar.setStyleSheet("")
 
     def closeEvent(self, event):
-        if self.mirror_proc and self.mirror_proc.poll() is None:
-            self.mirror_proc.terminate()
+        self._stop_session()
         event.accept()
 
 
