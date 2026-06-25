@@ -331,6 +331,15 @@ QPushButton#preset:checked { background: #3a1620; border: 1px solid #fe2c55; col
 QFrame#embedArea {
     background: #000000; border: 1px solid #26262b; border-radius: 12px;
 }
+QFrame#liveStage {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #161821, stop:1 #11131a);
+    border: 1px solid #243018; border-radius: 16px;
+}
+QLabel#stageIcon { font-size: 72px; }
+QLabel#stageTitle { font-size: 22px; font-weight: 800; color: #34d27b; }
+QLabel#stageDevice { font-size: 15px; font-weight: 700; color: #f1f1f1; }
+QLabel#stageHint { font-size: 13px; color: #9aa0a6; }
 QPushButton#act {
     background: #232328; border: 1px solid #44444c; border-radius: 9px;
     padding: 8px 14px; font-size: 13px; font-weight: 700;
@@ -467,6 +476,32 @@ class MainWindow(QWidget):
         self.embed_area.setMinimumHeight(360)
         self.embed_area.hide()
         root.addWidget(self.embed_area, 2)
+
+        # "เวที live" — เติมพื้นที่ตอนแคสแบบหน้าต่างแยก/สตรีม (ไม่ได้ฝังในแอป)
+        self.live_stage = QFrame()
+        self.live_stage.setObjectName("liveStage")
+        ls = QVBoxLayout(self.live_stage)
+        ls.setContentsMargins(24, 24, 24, 24)
+        ls.setSpacing(10)
+        ls.addStretch(1)
+        self.stage_icon = QLabel("📱")
+        self.stage_icon.setObjectName("stageIcon")
+        self.stage_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.stage_title = QLabel("กำลังแคสอยู่")
+        self.stage_title.setObjectName("stageTitle")
+        self.stage_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.stage_device = QLabel("")
+        self.stage_device.setObjectName("stageDevice")
+        self.stage_device.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.stage_hint = QLabel("")
+        self.stage_hint.setObjectName("stageHint")
+        self.stage_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.stage_hint.setWordWrap(True)
+        for wdg in (self.stage_icon, self.stage_title, self.stage_device, self.stage_hint):
+            ls.addWidget(wdg)
+        ls.addStretch(1)
+        self.live_stage.hide()
+        root.addWidget(self.live_stage, 2)
 
         # live bar (โผล่เฉพาะตอนกำลังแคส)
         self.live_bar = QFrame()
@@ -1010,8 +1045,13 @@ class MainWindow(QWidget):
 
         parent_hwnd = 0
         if embed_enabled:
+            self.live_stage.hide()
             self.embed_area.show()
             parent_hwnd = int(self.embed_area.winId())
+        else:
+            # แคสแบบหน้าต่างแยก/สตรีม → โชว์ "เวที live" เติมพื้นที่ให้ดูเต็ม
+            self.embed_area.hide()
+            self._show_live_stage(target, stream_mode)
 
         self.supervisor = ConnectionSupervisor(self.mgr, target, title, extra, parent_hwnd)
         self.supervisor.status.connect(self._on_session_status)
@@ -1036,6 +1076,7 @@ class MainWindow(QWidget):
         self.supervisor = None
         self.live_bar.hide()
         self.embed_area.hide()
+        self.live_stage.hide()
         self._show_connect_ui(True)
         self.embedded_hwnd = 0
         self.current_target = None
@@ -1077,6 +1118,9 @@ class MainWindow(QWidget):
         else:
             self._log("❌ ฝังหน้าจอไม่สำเร็จ (SetParent ล้มเหลว) — ใช้หน้าต่างแยกแทน")
             self.embed_area.hide()
+            # โชว์เวที live แทน เพื่อไม่ให้พื้นที่ว่างโล่ง
+            if self.current_target:
+                self._show_live_stage(self.current_target, self.opts.get("stream_mode", False))
 
     def _resize_embedded(self):
         if not (self.embedded_hwnd and self.embed_area.isVisible()):
@@ -1121,6 +1165,7 @@ class MainWindow(QWidget):
         self.live_bar.hide()
         self.live_bar.setStyleSheet("")
         self.embed_area.hide()
+        self.live_stage.hide()
         self._show_connect_ui(True)
         self.embedded_hwnd = 0
         self.btn_shot.setEnabled(False)
@@ -1150,6 +1195,17 @@ class MainWindow(QWidget):
         self._log("🔇 ปิดเสียงแล้ว" if self._session_muted else "🔊 เปิดเสียงแล้ว")
         self._restart_session()
 
+    def _show_live_stage(self, target: str, stream_mode: bool):
+        """โชว์เวที live (ตอนแคสแบบไม่ฝังในแอป) เพื่อเติมพื้นที่ให้ดูเต็ม"""
+        self.stage_device.setText(f"🟢 {target}")
+        if stream_mode:
+            self.stage_hint.setText(
+                f'หน้าจอมือถือเปิดในหน้าต่าง "{STREAM_TITLE}" — เลือกจับใน OBS ได้เลย')
+        else:
+            self.stage_hint.setText(
+                "หน้าจอมือถือเปิดเป็นหน้าต่างแยก — ย่อ/ขยาย/ลากวางได้อิสระ")
+        self.live_stage.show()
+
     # -------------------------------------------------- สถานะเรียลไทม์ (metrics)
     def _poll_metrics(self):
         """ยิงเธรดเก็บค่า แบต/รุ่น/ping (ไม่บล็อก UI)"""
@@ -1178,6 +1234,9 @@ class MainWindow(QWidget):
 
     def _on_metrics(self, data: dict):
         self._metrics.update(data)
+        # โชว์ชื่อรุ่นบนเวที live ด้วย (ดูเป็นมืออาชีพขึ้น)
+        if self.live_stage.isVisible() and self._metrics.get("model") and self.current_target:
+            self.stage_device.setText(f"🟢 {self._metrics['model']}  ·  {self.current_target}")
         self._render_meta()
 
     def _on_fps(self, fps: int):
