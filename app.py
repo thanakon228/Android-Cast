@@ -435,8 +435,10 @@ class MainWindow(QWidget):
         self.progress.hide()
         root.addWidget(self.progress)
 
-        # tabs
-        tab_row = QHBoxLayout()
+        # tabs (ห่อใน widget เพื่อให้ซ่อนทั้งแถบได้ตอนกำลังแคส)
+        self.tab_bar = QWidget()
+        tab_row = QHBoxLayout(self.tab_bar)
+        tab_row.setContentsMargins(0, 0, 0, 0)
         tab_row.setSpacing(18)
         self.tab_wifi = QPushButton("📶  WiFi")
         self.tab_usb = QPushButton("🔌  USB")
@@ -450,7 +452,7 @@ class MainWindow(QWidget):
         for t in self._tabs:
             tab_row.addWidget(t)
         tab_row.addStretch(1)
-        root.addLayout(tab_row)
+        root.addWidget(self.tab_bar)
 
         # stacked pages
         self.stack = QStackedWidget()
@@ -734,6 +736,11 @@ class MainWindow(QWidget):
             t.setChecked(i == idx)
         self.stack.setCurrentIndex(idx)
 
+    def _show_connect_ui(self, show: bool):
+        """ซ่อน/แสดงการ์ดการเชื่อมต่อทั้งหมด (แท็บ + หน้า) ขณะกำลังแคส"""
+        self.tab_bar.setVisible(show)
+        self.stack.setVisible(show)
+
     def _set_busy(self, busy: bool, msg: str = ""):
         for b in (getattr(self, "btn_pair", None), getattr(self, "btn_usb_go", None)):
             if b:
@@ -1011,6 +1018,7 @@ class MainWindow(QWidget):
         self.supervisor.embed_ready.connect(self._on_embed_ready)
         self.supervisor.finished.connect(self._on_session_finished)
         self.supervisor.start()
+        self._show_connect_ui(False)   # ซ่อนการ์ดเชื่อมต่อขณะแคส
         self.live_bar.show()
         self.btn_shot.setEnabled(True)
         self.btn_rotate.setEnabled(True)
@@ -1028,7 +1036,7 @@ class MainWindow(QWidget):
         self.supervisor = None
         self.live_bar.hide()
         self.embed_area.hide()
-        self.stack.show()
+        self._show_connect_ui(True)
         self.embedded_hwnd = 0
         self.current_target = None
         self.btn_shot.setEnabled(False)
@@ -1113,7 +1121,7 @@ class MainWindow(QWidget):
         self.live_bar.hide()
         self.live_bar.setStyleSheet("")
         self.embed_area.hide()
-        self.stack.show()
+        self._show_connect_ui(True)
         self.embedded_hwnd = 0
         self.btn_shot.setEnabled(False)
         self.btn_rotate.setEnabled(False)
