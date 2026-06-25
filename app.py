@@ -90,6 +90,8 @@ def build_scrcpy_args(opts: dict, record_path=None) -> list[str]:
         a += ["--window-borderless"]
     if record_path:
         a += ["--record", str(record_path)]
+    # พิมพ์ค่า fps ออกมาเพื่อให้แอปอ่านไปแสดงบนแถบ live (ไม่ขึ้น console)
+    a += ["--print-fps"]
     return a
 
 
@@ -298,6 +300,7 @@ QFrame#liveBar {
     background: #14241b; border: 1px solid #1f5138; border-radius: 12px;
 }
 QLabel#liveText { font-size: 13px; font-weight: 600; }
+QLabel#liveMeta { font-size: 12px; color: #8fd9b0; font-weight: 600; }
 QPushButton#stop {
     background: #2a2a30; border: 1px solid #44444c; border-radius: 9px;
     padding: 8px 16px; font-size: 13px; font-weight: 700;
@@ -354,6 +357,10 @@ def make_qr_pixmap(data: str, size: int = 190) -> QPixmap:
 # หน้าต่างหลัก
 # ---------------------------------------------------------------------------
 class MainWindow(QWidget):
+    # สัญญาณค่าเรียลไทม์ (emit จากเธรดอื่นได้อย่างปลอดภัย)
+    fps_signal = pyqtSignal(int)
+    metrics_signal = pyqtSignal(dict)
+
     def __init__(self):
         super().__init__()
         self.mgr = ScrcpyManager()
@@ -365,10 +372,24 @@ class MainWindow(QWidget):
         self.embedded_hwnd: int = 0               # HWND ของ scrcpy ที่ฝังอยู่
         self._embed_aspect: float = 0.0           # อัตราส่วน w/h ของจอมือถือ (จัด contain-fit)
 
+        # สถานะ session ที่ปรับได้จากปุ่มบนแถบ live
+        self._session_rotation = 0                # องศาหมุนจอ (0/90/180/270)
+        self._session_muted = False               # ปิดเสียงชั่วคราว
+        self._metrics = {"model": "", "batt": -1, "charging": False,
+                         "ping": -1, "fps": -1}
+
         # console log bus (ส่ง log จาก adb/scrcpy/เธรดต่าง ๆ เข้าหน้าจอ)
         self.bus = LogBus()
         self.bus.line.connect(self._append_console)
         self.mgr.logger = self.bus.line.emit
+        self.mgr.fps_callback = self.fps_signal.emit
+        self.fps_signal.connect(self._on_fps)
+        self.metrics_signal.connect(self._on_metrics)
+
+        # ตัวจับเวลาเก็บค่าสถานะ (แบต/รุ่น/ping) ขณะแคส
+        self._metrics_timer = QTimer(self)
+        self._metrics_timer.setInterval(5000)
+        self._metrics_timer.timeout.connect(self._poll_metrics)
 
         self.setObjectName("root")
         self.setWindowTitle(APP_NAME)
@@ -448,21 +469,44 @@ class MainWindow(QWidget):
         # live bar (โผล่เฉพาะตอนกำลังแคส)
         self.live_bar = QFrame()
         self.live_bar.setObjectName("liveBar")
-        lb = QHBoxLayout(self.live_bar)
-        lb.setContentsMargins(14, 10, 12, 10)
+        lb_outer = QVBoxLayout(self.live_bar)
+        lb_outer.setContentsMargins(14, 10, 12, 10)
+        lb_outer.setSpacing(6)
+
+        lb = QHBoxLayout()
+        lb.setSpacing(8)
         self.live_text = QLabel("")
         self.live_text.setObjectName("liveText")
         self.live_text.setWordWrap(True)
+        self.btn_rotate = QPushButton("🔄")
+        self.btn_rotate.setObjectName("act")
+        self.btn_rotate.setToolTip("หมุนจอ (90°)")
+        self.btn_rotate.setEnabled(False)
+        self.btn_rotate.clicked.connect(self._rotate_screen)
+        self.btn_mute = QPushButton("🔊")
+        self.btn_mute.setObjectName("act")
+        self.btn_mute.setToolTip("ปิด/เปิดเสียง")
+        self.btn_mute.setEnabled(False)
+        self.btn_mute.clicked.connect(self._toggle_mute)
         self.btn_shot = QPushButton("📸 แคปจอ")
         self.btn_shot.setObjectName("act")
         self.btn_shot.setEnabled(False)
         self.btn_shot.clicked.connect(self._take_screenshot)
-        self.btn_stop = QPushButton("หยุดแคส")
+        self.btn_stop = QPushButton("🔌 ตัดการเชื่อมต่อ")
         self.btn_stop.setObjectName("stop")
         self.btn_stop.clicked.connect(self._stop_session)
         lb.addWidget(self.live_text, 1)
+        lb.addWidget(self.btn_rotate)
+        lb.addWidget(self.btn_mute)
         lb.addWidget(self.btn_shot)
         lb.addWidget(self.btn_stop)
+        lb_outer.addLayout(lb)
+
+        # แถวข้อมูลสถานะเรียลไทม์
+        self.live_meta = QLabel("—")
+        self.live_meta.setObjectName("liveMeta")
+        lb_outer.addWidget(self.live_meta)
+
         self.live_bar.hide()
         root.addWidget(self.live_bar)
 
@@ -918,10 +962,18 @@ class MainWindow(QWidget):
         self._run(task, on_done=self._after_connect, busy_msg="กำลังเปิดโหมดไร้สาย...")
 
     # ------------------------------------------------------- mirror session
-    def _start_session(self, target: str):
+    def _start_session(self, target: str, *, keep_session_state: bool = False):
         """เริ่มแคส + เปิด supervisor ที่จะต่อใหม่อัตโนมัติเมื่อหลุด"""
+        if not keep_session_state:
+            # เชื่อมต่อใหม่จริง → รีเซ็ตสถานะปุ่มหมุน/ปิดเสียง
+            self._session_rotation = 0
+            self._session_muted = False
         self._stop_session()  # เคลียร์ session เก่า (ถ้ามี)
         self.current_target = target
+        # รีเซ็ตค่าสถานะที่จะโชว์
+        self._metrics = {"model": "", "batt": -1, "charging": False,
+                         "ping": -1, "fps": -1}
+        self._render_meta()
 
         record_path = None
         if self.opts.get("record"):
@@ -930,6 +982,11 @@ class MainWindow(QWidget):
             self._log(f"🔴 อัดวิดีโอไว้ที่: {record_path}")
 
         extra = build_scrcpy_args(self.opts, record_path)
+        # ปรับจากปุ่มบนแถบ live
+        if self._session_rotation:
+            extra += ["--display-orientation", str(self._session_rotation)]
+        if self._session_muted and "--no-audio" not in extra:
+            extra += ["--no-audio"]
 
         stream_mode = self.opts.get("stream_mode")
         # โหมดสตรีมต้องเป็นหน้าต่างแยก top-level → ปิดการฝังอัตโนมัติ
@@ -956,8 +1013,14 @@ class MainWindow(QWidget):
         self.supervisor.start()
         self.live_bar.show()
         self.btn_shot.setEnabled(True)
+        self.btn_rotate.setEnabled(True)
+        self.btn_mute.setEnabled(True)
+        self.btn_mute.setText("🔇" if self._session_muted else "🔊")
+        self._poll_metrics()           # เก็บค่าทันที 1 รอบ
+        self._metrics_timer.start()
 
     def _stop_session(self):
+        self._metrics_timer.stop()
         sup = self.supervisor
         if sup and sup.isRunning():
             sup.stop()
@@ -969,6 +1032,8 @@ class MainWindow(QWidget):
         self.embedded_hwnd = 0
         self.current_target = None
         self.btn_shot.setEnabled(False)
+        self.btn_rotate.setEnabled(False)
+        self.btn_mute.setEnabled(False)
 
     # ------------------------------------------------------------- screenshot
     def _take_screenshot(self):
@@ -1044,13 +1109,89 @@ class MainWindow(QWidget):
 
     def _on_session_finished(self):
         # supervisor จบลูปแล้ว (ผู้ใช้ปิดหน้าต่าง / ยอมแพ้ / สั่งหยุด)
+        self._metrics_timer.stop()
         self.live_bar.hide()
         self.live_bar.setStyleSheet("")
         self.embed_area.hide()
         self.stack.show()
         self.embedded_hwnd = 0
         self.btn_shot.setEnabled(False)
+        self.btn_rotate.setEnabled(False)
+        self.btn_mute.setEnabled(False)
         self.current_target = None
+
+    # -------------------------------------------------- ปุ่มควบคุมบนแถบ live
+    def _restart_session(self):
+        """เปิดมิเรอร์ใหม่ด้วยออปชันปัจจุบัน (คงสถานะปุ่มหมุน/ปิดเสียงไว้)"""
+        target = self.current_target
+        if target:
+            self._start_session(target, keep_session_state=True)
+
+    def _rotate_screen(self):
+        if not self.current_target:
+            return
+        self._session_rotation = (self._session_rotation + 90) % 360
+        self._log(f"🔄 หมุนจอเป็น {self._session_rotation}°")
+        self._restart_session()
+
+    def _toggle_mute(self):
+        if not self.current_target:
+            return
+        self._session_muted = not self._session_muted
+        self.btn_mute.setText("🔇" if self._session_muted else "🔊")
+        self._log("🔇 ปิดเสียงแล้ว" if self._session_muted else "🔊 เปิดเสียงแล้ว")
+        self._restart_session()
+
+    # -------------------------------------------------- สถานะเรียลไทม์ (metrics)
+    def _poll_metrics(self):
+        """ยิงเธรดเก็บค่า แบต/รุ่น/ping (ไม่บล็อก UI)"""
+        target = self.current_target
+        if not target:
+            return
+        threading.Thread(target=self._gather_metrics, args=(target,),
+                         daemon=True).start()
+
+    def _gather_metrics(self, target: str):
+        data = {}
+        # ชื่อรุ่น: ดึงครั้งเดียวพอ
+        if not self._metrics.get("model"):
+            data["model"] = self.mgr.device_model(target)
+        level, charging = self.mgr.battery_level(target)
+        data["batt"] = level
+        data["charging"] = charging
+        # ping: เฉพาะอุปกรณ์ไร้สาย (target = ip:port)
+        if ":" in target and target.split(":")[0].count(".") == 3:
+            data["ping"] = self.mgr.ping_ms(target.split(":")[0])
+        else:
+            data["ping"] = -1   # USB ไม่มี ping
+        # ป้องกัน emit หลัง session ปิดไปแล้ว
+        if self.current_target == target:
+            self.metrics_signal.emit(data)
+
+    def _on_metrics(self, data: dict):
+        self._metrics.update(data)
+        self._render_meta()
+
+    def _on_fps(self, fps: int):
+        self._metrics["fps"] = fps
+        self._render_meta()
+
+    def _render_meta(self):
+        m = self._metrics
+        parts = []
+        if m.get("model"):
+            parts.append(f"📱 {m['model']}")
+        if m.get("batt", -1) >= 0:
+            parts.append(f"🔋 {m['batt']}%" + ("⚡" if m.get("charging") else ""))
+        if m.get("fps", -1) >= 0:
+            parts.append(f"🎞️ {m['fps']} fps")
+        if m.get("ping", -1) >= 0:
+            parts.append(f"📶 {m['ping']} ms")
+        elif self.current_target and ":" not in (self.current_target or ""):
+            parts.append("📶 USB")
+        if self.opts.get("bitrate"):
+            parts.append(f"⚙️ {self.opts['bitrate']}")
+        self.live_meta.setText("    ".join(parts) if parts else "—")
 
     def closeEvent(self, event):
         self._stop_session()

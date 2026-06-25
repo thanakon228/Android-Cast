@@ -62,6 +62,8 @@ class ScrcpyManager:
         self.adb_path: Optional[Path] = None
         # callback รับข้อความ log (set จากภายนอก) — ต้อง thread-safe ฝั่งผู้รับ
         self.logger: Optional[Callable[[str], None]] = None
+        # callback รับค่า FPS เรียลไทม์ (parse จาก --print-fps) — ต้อง thread-safe
+        self.fps_callback: Optional[Callable[[int], None]] = None
         self._locate_existing()
 
     def _log(self, msg: str) -> None:
@@ -298,15 +300,75 @@ class ScrcpyManager:
         return subprocess.Popen(args, env=env, creationflags=_CREATE_NO_WINDOW)
 
     def _pump_output(self, proc: subprocess.Popen) -> None:
-        """อ่าน output ของ scrcpy ทีละบรรทัดส่งเข้า logger"""
+        """อ่าน output ของ scrcpy ทีละบรรทัดส่งเข้า logger + ดึงค่า FPS"""
         try:
             assert proc.stdout is not None
             for line in proc.stdout:
                 line = line.rstrip()
-                if line:
-                    self._log("[scrcpy] " + line)
+                if not line:
+                    continue
+                # ดึงเลข fps จากบรรทัดที่ scrcpy พิมพ์ออกมา (จาก --print-fps)
+                # แล้วไม่ log บรรทัด fps ลง console (กันรก เพราะพิมพ์ทุกวินาที)
+                if "fps" in line:
+                    m = re.search(r"(\d+)\s*fps", line)
+                    if m:
+                        if self.fps_callback:
+                            try:
+                                self.fps_callback(int(m.group(1)))
+                            except Exception:  # noqa: BLE001
+                                pass
+                        continue
+                self._log("[scrcpy] " + line)
         except Exception:  # noqa: BLE001
             pass
+
+    # ----------------------------------------------------- ข้อมูลสถานะอุปกรณ์
+    def device_model(self, serial: str) -> str:
+        """ชื่อรุ่นมือถือ (เช่น 'Pixel 7')"""
+        try:
+            cp = self._adb("-s", serial, "shell", "getprop", "ro.product.model", timeout=8)
+            return cp.stdout.strip()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def battery_level(self, serial: str) -> tuple[int, bool]:
+        """คืน (เปอร์เซ็นต์แบต, กำลังชาร์จ?) — (-1, False) ถ้าอ่านไม่ได้"""
+        level, charging = -1, False
+        try:
+            cp = self._adb("-s", serial, "shell", "dumpsys", "battery", timeout=8)
+            for line in cp.stdout.splitlines():
+                s = line.strip()
+                if s.startswith("level:"):
+                    try:
+                        level = int(s.split(":", 1)[1].strip())
+                    except ValueError:
+                        pass
+                elif s.startswith("status:"):
+                    # 2=charging, 5=full
+                    charging = s.split(":", 1)[1].strip() in ("2", "5") or charging
+                elif s.startswith("AC powered:") and "true" in s:
+                    charging = True
+                elif s.startswith("USB powered:") and "true" in s:
+                    charging = True
+        except Exception:  # noqa: BLE001
+            pass
+        return level, charging
+
+    def ping_ms(self, ip: str) -> int:
+        """ping ไป IP มือถือ คืนค่าหน่วง (ms) — -1 ถ้า ping ไม่ได้"""
+        try:
+            cp = subprocess.run(
+                ["ping", "-n", "1", "-w", "1000", ip],
+                capture_output=True, text=True, timeout=4,
+                encoding="utf-8", errors="replace",
+                creationflags=_CREATE_NO_WINDOW,
+            )
+            m = re.search(r"[<=]\s*(\d+)\s*ms", cp.stdout)
+            if m:
+                return int(m.group(1))
+        except Exception:  # noqa: BLE001
+            pass
+        return -1
 
 
 # ------------------------------------------------------------------ helpers
