@@ -17,6 +17,7 @@ import shutil
 import socket
 import subprocess
 import threading
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,6 +65,11 @@ class ScrcpyManager:
         self.logger: Optional[Callable[[str], None]] = None
         # callback รับค่า FPS เรียลไทม์ (parse จาก --print-fps) — ต้อง thread-safe
         self.fps_callback: Optional[Callable[[int], None]] = None
+        # แคชภาพหน้าจอช่วงสั้น ๆ (กันยิง adb ซ้ำถี่ ๆ เวลาหา template หลายรูป)
+        # TTL ~150ms: นานพอลด adb roundtrip แต่สั้นพอภาพยังสด — ล้างทันทีหลังสั่ง input
+        self.screencap_ttl: float = 0.15
+        self._screencap_cache: dict[str, tuple[float, bytes]] = {}
+        self._screencap_lock = threading.Lock()
         self._locate_existing()
 
     def _log(self, msg: str) -> None:
@@ -371,10 +377,28 @@ class ScrcpyManager:
         return -1
 
     # ------------------------------------------------ คุมมือถือ (สำหรับบอท/ปลั๊กอิน)
-    def screencap_bytes(self, serial: str) -> bytes:
-        """จับภาพหน้าจอเป็น PNG (bytes) — ไม่เขียนไฟล์ (เหมาะกับบอท/AI)"""
+    def invalidate_screencap(self, serial: Optional[str] = None) -> None:
+        """ทิ้งแคชภาพหน้าจอ (serial เดียว หรือทั้งหมดถ้า None) — เรียกหลังสั่ง input"""
+        with self._screencap_lock:
+            if serial is None:
+                self._screencap_cache.clear()
+            else:
+                self._screencap_cache.pop(serial, None)
+
+    def screencap_bytes(self, serial: str, use_cache: bool = True) -> bytes:
+        """
+        จับภาพหน้าจอเป็น PNG (bytes) — ไม่เขียนไฟล์ (เหมาะกับบอท/AI)
+
+        use_cache=True: คืนภาพเดิมถ้าเพิ่งจับไปไม่เกิน screencap_ttl วินาที
+        (ช่วยตอนหา template หลายรูปติด ๆ กัน — ยิง adb ครั้งเดียว)
+        """
         if not self.adb_path:
             raise ToolError("ยังไม่มี adb")
+        if use_cache:
+            with self._screencap_lock:
+                hit = self._screencap_cache.get(serial)
+                if hit and (time.monotonic() - hit[0]) < self.screencap_ttl:
+                    return hit[1]
         cp = subprocess.run(
             [str(self.adb_path), "-s", serial, "exec-out", "screencap", "-p"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20,
@@ -383,6 +407,9 @@ class ScrcpyManager:
         if cp.returncode != 0 or not cp.stdout:
             err = cp.stderr.decode("utf-8", "replace").strip() if cp.stderr else ""
             raise ToolError(err or "จับภาพหน้าจอไม่สำเร็จ")
+        if use_cache:
+            with self._screencap_lock:
+                self._screencap_cache[serial] = (time.monotonic(), cp.stdout)
         return cp.stdout
 
     def screen_size(self, serial: str) -> tuple[int, int]:
@@ -398,21 +425,25 @@ class ScrcpyManager:
 
     def input_tap(self, serial: str, x: int, y: int) -> None:
         self._adb("-s", serial, "shell", "input", "tap", str(int(x)), str(int(y)), timeout=10)
+        self.invalidate_screencap(serial)   # จอเปลี่ยนแล้ว — แคชเก่าใช้ไม่ได้
 
     def input_swipe(self, serial: str, x1: int, y1: int, x2: int, y2: int,
                     duration_ms: int = 200) -> None:
         self._adb("-s", serial, "shell", "input", "swipe",
                   str(int(x1)), str(int(y1)), str(int(x2)), str(int(y2)),
                   str(int(duration_ms)), timeout=10)
+        self.invalidate_screencap(serial)
 
     def input_keyevent(self, serial: str, keycode) -> None:
         """ส่งปุ่ม (เลข keycode หรือชื่อ เช่น 'KEYCODE_HOME')"""
         self._adb("-s", serial, "shell", "input", "keyevent", str(keycode), timeout=10)
+        self.invalidate_screencap(serial)
 
     def input_text(self, serial: str, text: str) -> None:
         """พิมพ์ข้อความ (เว้นวรรคแทนด้วย %s ตามที่ adb ต้องการ)"""
         self._adb("-s", serial, "shell", "input", "text",
                   text.replace(" ", "%s"), timeout=10)
+        self.invalidate_screencap(serial)
 
 
 # ------------------------------------------------------------------ helpers

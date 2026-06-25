@@ -24,7 +24,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, QSize, QTimer
-from PyQt6.QtGui import QPixmap, QImage, QFont, QTextCursor
+from PyQt6.QtGui import QPixmap, QImage, QFont, QTextCursor, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QLineEdit, QStackedWidget, QFrame, QProgressBar, QMessageBox, QPlainTextEdit,
@@ -37,6 +37,7 @@ import win_embed
 from scrcpy_manager import ScrcpyManager, ToolError, local_ip
 from settings_store import load_settings, save_settings
 from plugin_manager import PluginManager
+from bot_http_api import BotHttpApi
 
 APP_NAME = "ScreenCast Studio"
 
@@ -66,6 +67,8 @@ DEFAULT_OPTS = {
     "always_on_top": False,  # หน้าต่างอยู่บนสุด
     "embed": False,          # ฝังหน้าจอในแอป (ทดลอง)
     "stream_mode": False,    # โหมดสตรีม OBS: หน้าต่างแยก ชื่อคงที่ (OBS เลือกเจอ)
+    "http_api": False,       # เปิด REST API ให้สคริปต์ภายนอกสั่งคุมมือถือ (localhost)
+    "http_api_port": "8770", # พอร์ตของ REST API
 }
 
 # พรีเซ็ตคุณภาพ
@@ -418,17 +421,30 @@ class MainWindow(QWidget):
         self._loaded_plugins: list = []     # ผลจาก discover()
         self._plugin_cards: dict = {}       # key -> dict(widgets)
 
+        # REST API (localhost) ให้สคริปต์ภายนอกสั่งคุมมือถือ — เปิด/ปิดจากแท็บตั้งค่า
+        self.http_api = BotHttpApi(
+            self.mgr, get_serial=self._active_device_serial,
+            plugin_mgr=self.plugin_mgr, logger=self.bus.line.emit)
+
         self.setObjectName("root")
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(QSize(560, 720))
         self._build_ui()
+        self._setup_shortcuts()
         self._refresh_status()
+        self._apply_http_api()              # เปิดเซิร์ฟเวอร์ถ้าตั้งค่าไว้
 
         # เตรียมเครื่องมือ (ดาวน์โหลด scrcpy ถ้ายังไม่มี)
         if not self.mgr.is_ready:
             self._download_tools()
         else:
             self._set_busy(False, "พร้อมใช้งาน scrcpy แล้ว")
+
+    # ------------------------------------------------------------- คีย์ลัด
+    def _setup_shortcuts(self):
+        """คีย์ลัดทั่วแอป: F5 = แคปจอ, F6 = ตัดการเชื่อมต่อ (มีถามยืนยัน)"""
+        QShortcut(QKeySequence("F5"), self, activated=self._take_screenshot)
+        QShortcut(QKeySequence("F6"), self, activated=self._confirm_stop_session)
 
     # ----------------------------------------------------------------- build
     def _build_ui(self):
@@ -548,10 +564,12 @@ class MainWindow(QWidget):
         self.btn_shot = QPushButton("📸 แคปจอ")
         self.btn_shot.setObjectName("act")
         self.btn_shot.setEnabled(False)
+        self.btn_shot.setToolTip("แคปหน้าจอ (F5)")
         self.btn_shot.clicked.connect(self._take_screenshot)
         self.btn_stop = QPushButton("🔌 ตัดการเชื่อมต่อ")
         self.btn_stop.setObjectName("stop")
-        self.btn_stop.clicked.connect(self._stop_session)
+        self.btn_stop.setToolTip("ตัดการเชื่อมต่อ (F6)")
+        self.btn_stop.clicked.connect(self._confirm_stop_session)
         lb.addWidget(self.live_text, 1)
         lb.addWidget(self.btn_rotate)
         lb.addWidget(self.btn_mute)
@@ -945,6 +963,26 @@ class MainWindow(QWidget):
             lambda on: self.cb_stream.setChecked(False) if on else None)
         outer.addWidget(card)
 
+        # ---- REST API (สำหรับสคริปต์ภายนอก) ----
+        card, lay = self._card()
+        lay.addWidget(self._h("🌐 REST API (ขั้นสูง)"))
+        api_desc = QLabel(
+            "เปิดให้สคริปต์ภายนอกสั่งคุมมือถือผ่าน HTTP — ผูกกับ "
+            "<b>localhost เท่านั้น</b> (เครื่องอื่นในวงเน็ตเข้าไม่ได้)")
+        api_desc.setObjectName("hint")
+        api_desc.setWordWrap(True)
+        lay.addWidget(api_desc)
+        self.cb_http_api = QCheckBox("🌐 เปิด REST API ขณะใช้งาน")
+        lay.addWidget(self.cb_http_api)
+        port_row = QHBoxLayout()
+        port_row.addWidget(QLabel("พอร์ต"))
+        self.in_http_port = QLineEdit()
+        self.in_http_port.setFixedWidth(100)
+        port_row.addWidget(self.in_http_port)
+        port_row.addStretch(1)
+        lay.addLayout(port_row)
+        outer.addWidget(card)
+
         # ---- ปุ่มบันทึก / เปิดโฟลเดอร์ ----
         btn_save = QPushButton("💾 บันทึกการตั้งค่า")
         btn_save.setObjectName("primary")
@@ -1018,6 +1056,8 @@ class MainWindow(QWidget):
         self.cb_aot.setChecked(o["always_on_top"])
         self.cb_embed.setChecked(o["embed"])
         self.cb_stream.setChecked(o.get("stream_mode", False))
+        self.cb_http_api.setChecked(o.get("http_api", False))
+        self.in_http_port.setText(str(o.get("http_api_port", "8770")))
 
     def _apply_preset(self, name: str):
         p = PRESETS[name]
@@ -1039,14 +1079,37 @@ class MainWindow(QWidget):
             "always_on_top": self.cb_aot.isChecked(),
             "embed": self.cb_embed.isChecked(),
             "stream_mode": self.cb_stream.isChecked(),
+            "http_api": self.cb_http_api.isChecked(),
+            "http_api_port": self.in_http_port.text().strip() or "8770",
         }
 
     def _save_options(self):
         self.opts = self._collect_options()
         self.settings["options"] = self.opts
         save_settings(self.settings)
+        self._apply_http_api()      # เปิด/ปิด/รีสตาร์ต REST API ตามค่าที่เพิ่งบันทึก
         self._log("💾 บันทึกการตั้งค่าแล้ว (มีผลกับการแคสครั้งถัดไป)")
         self._toast("บันทึกแล้ว", "การตั้งค่าจะมีผลกับการแคสครั้งถัดไป")
+
+    def _apply_http_api(self):
+        """เปิด/ปิด REST API ให้ตรงกับ self.opts (รีสตาร์ตถ้าพอร์ตเปลี่ยน)"""
+        want = bool(self.opts.get("http_api", False))
+        try:
+            port = int(self.opts.get("http_api_port", "8770") or 8770)
+        except ValueError:
+            port = 8770
+        # ปิดก่อนถ้ากำลังรันแต่ไม่ต้องการแล้ว หรือพอร์ตเปลี่ยน
+        if self.http_api.is_running and (not want or self.http_api.port != port):
+            self.http_api.stop()
+        if want and not self.http_api.is_running:
+            self.http_api.port = port
+            try:
+                self.http_api.start()
+            except OSError as e:
+                self._log(f"❌ เปิด REST API ไม่ได้ (พอร์ต {port}): {e}")
+                self._toast("เปิด REST API ไม่ได้",
+                            f"พอร์ต {port} อาจถูกใช้อยู่: {e}",
+                            QMessageBox.Icon.Warning)
 
     def _open_folder(self, path: Path):
         path.mkdir(parents=True, exist_ok=True)
@@ -1274,6 +1337,20 @@ class MainWindow(QWidget):
         self._poll_metrics()           # เก็บค่าทันที 1 รอบ
         self._metrics_timer.start()
 
+    def _confirm_stop_session(self):
+        """ถามยืนยันก่อนตัดการเชื่อมต่อ (กันกดพลาด / กด F6 โดนเอง)"""
+        if not (self.supervisor and self.supervisor.isRunning()):
+            return                                    # ไม่ได้แคสอยู่ — ไม่ต้องทำอะไร
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("ยืนยันการตัดการเชื่อมต่อ")
+        box.setText("ต้องการหยุดแคสและตัดการเชื่อมต่อตอนนี้หรือไม่?")
+        box.setStandardButtons(QMessageBox.StandardButton.Yes |
+                               QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        if box.exec() == QMessageBox.StandardButton.Yes:
+            self._stop_session()
+
     def _stop_session(self):
         self._metrics_timer.stop()
         sup = self.supervisor
@@ -1468,6 +1545,7 @@ class MainWindow(QWidget):
         self.live_meta.setText("    ".join(parts) if parts else "—")
 
     def closeEvent(self, event):
+        self.http_api.stop()
         self.plugin_mgr.stop_all()
         self._stop_session()
         event.accept()

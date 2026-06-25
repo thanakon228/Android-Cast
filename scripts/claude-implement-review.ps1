@@ -32,23 +32,17 @@ if ($waited -ge $maxWaitMin) {
     exit 1
 }
 
-git fetch origin
+git fetch origin 2>&1 | Out-Null
 if (-not (git branch --list $Branch)) {
-    git checkout -b $Branch origin/AutoMation
+    git checkout -b $Branch origin/AutoMation 2>&1 | Out-Null
 } else {
-    git checkout $Branch
-    git pull --ff-only origin $Branch 2>$null
+    git checkout $Branch 2>&1 | Out-Null
+    git pull --ff-only origin $Branch 2>&1 | Out-Null
 }
-
-$taskFile = Join-Path $Repo "CLAUDE_TASK.md"
-if (-not (Test-Path $taskFile)) {
-    Write-Log "ERROR: CLAUDE_TASK.md not found"
-    exit 1
-}
-$Prompt = Get-Content $taskFile -Raw -Encoding UTF8
 
 Write-Log "Starting Claude Code implementation..."
-claude -p --dangerously-skip-permissions $Prompt 2>&1 | Tee-Object -FilePath $Log -Append
+$taskFile = Join-Path $Repo "CLAUDE_TASK.md"
+Get-Content $taskFile -Raw -Encoding UTF8 | claude -p --dangerously-skip-permissions 2>&1 | Tee-Object -FilePath $Log -Append
 if ($LASTEXITCODE -ne 0) {
     Write-Log "ERROR: claude exit code $LASTEXITCODE"
     exit $LASTEXITCODE

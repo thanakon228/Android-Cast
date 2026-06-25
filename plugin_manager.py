@@ -26,6 +26,7 @@ from typing import Optional
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from ai_providers import register_builtin_providers
 from plugin_api import AIRegistry, BotContext, BotPlugin, PluginMeta
 
 
@@ -87,6 +88,7 @@ class PluginManager:
         self.mgr = mgr                       # ScrcpyManager
         self.logger = logger                 # callable(str) -> console
         self.ai = AIRegistry()               # ทะเบียน AI ส่วนกลาง
+        register_builtin_providers(self.ai)  # เพิ่ม provider ที่มากับแอป (OCR ฯลฯ)
         # config ต่อปลั๊กอิน เก็บใน settings.json ใต้คีย์ "plugins"
         self._config_store = config_store    # dict {key: {...}}
         self._save_settings = save_settings_cb

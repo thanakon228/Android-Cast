@@ -78,6 +78,55 @@ class Vision:
             return (max_loc[0] + w // 2, max_loc[1] + h // 2, float(max_val))
         return None
 
+    def find_all_templates(self, template, threshold: float = 0.85,
+                           max_results: int = 50, min_distance: int = 10):
+        """
+        หา template ทุกตำแหน่งบนหน้าจอ (ไม่ใช่แค่จุดที่ดีที่สุด)
+        คืน list ของ (x, y, score) เรียงจากความมั่นใจมาก→น้อย — [] ถ้าไม่เจอ
+
+        min_distance = ระยะพิกเซลขั้นต่ำระหว่างจุดที่นับว่าเป็นคนละจุด
+                       (กัน match ซ้อนกันรอบ ๆ จุดเดียว — non-maximum suppression อย่างง่าย)
+        """
+        cv2, np = self._cv()
+        screen = self.ctx.screencap_np()
+        tmpl = cv2.imread(template) if isinstance(template, str) else template
+        if tmpl is None:
+            raise FileNotFoundError(f"เปิดไฟล์ template ไม่ได้: {template}")
+        res = cv2.matchTemplate(screen, tmpl, cv2.TM_CCOEFF_NORMED)
+        h, w = tmpl.shape[:2]
+        ys, xs = np.where(res >= threshold)
+        # เรียงตามคะแนนมากก่อน แล้วค่อยกรองจุดที่อยู่ใกล้กันออก (NMS)
+        cands = sorted(((float(res[y, x]), int(x), int(y)) for y, x in zip(ys, xs)),
+                       reverse=True)
+        hits: list[tuple[int, int, float]] = []
+        for score, x, y in cands:
+            cx, cy = x + w // 2, y + h // 2
+            if any(abs(cx - hx) < min_distance and abs(cy - hy) < min_distance
+                   for hx, hy, _ in hits):
+                continue
+            hits.append((cx, cy, score))
+            if len(hits) >= max_results:
+                break
+        return hits
+
+    def wait_for_template(self, template, threshold: float = 0.85,
+                          timeout: float = 10.0, interval: float = 0.5):
+        """
+        รอจน template โผล่บนหน้าจอ (poll เป็นรอบ ๆ)
+        คืน (x, y, score) เมื่อเจอ, หรือ None ถ้าครบ timeout / ผู้ใช้สั่งหยุด
+
+        เคารพ ctx.should_stop() — ถ้าผู้ใช้กดหยุดระหว่างรอ จะคืน None ทันที
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        while not self.ctx.should_stop():
+            hit = self.find_template(template, threshold)
+            if hit:
+                return hit
+            if time.monotonic() >= deadline:
+                return None
+            self.ctx.sleep(interval)
+        return None
+
     def tap_template(self, template, threshold: float = 0.85) -> bool:
         """หา template แล้วแตะตรงนั้นเลย — คืน True ถ้าเจอและแตะแล้ว"""
         hit = self.find_template(template, threshold)
