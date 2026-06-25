@@ -40,6 +40,10 @@ if _AVAILABLE:
                                      ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
     _user32.IsWindowVisible.restype = wintypes.BOOL
     _user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    _user32.GetClientRect.restype = wintypes.BOOL
+    _user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    _user32.GetWindowRect.restype = wintypes.BOOL
+    _user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
     _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
     _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
 
@@ -125,3 +129,30 @@ def embed(child_hwnd: int, parent_hwnd: int) -> bool:
 def resize(child_hwnd: int, w: int, h: int) -> None:
     if _AVAILABLE and child_hwnd:
         _user32.MoveWindow(child_hwnd, 0, 0, max(1, int(w)), max(1, int(h)), True)
+
+
+def place(child_hwnd: int, x: int, y: int, w: int, h: int) -> None:
+    """ย้าย+ปรับขนาดหน้าต่างลูก (กำหนดตำแหน่ง x,y ได้ — ใช้จัดกึ่งกลาง)"""
+    if _AVAILABLE and child_hwnd:
+        _user32.MoveWindow(child_hwnd, int(x), int(y),
+                           max(1, int(w)), max(1, int(h)), True)
+
+
+def window_size(hwnd: int) -> tuple[int, int]:
+    """ขนาดกรอบหน้าต่าง (รวมขอบ) — ใช้ตอนยังเป็น top-level เพื่อหาอัตราส่วน"""
+    if not (_AVAILABLE and hwnd):
+        return (0, 0)
+    r = wintypes.RECT()
+    if _user32.GetWindowRect(hwnd, ctypes.byref(r)):
+        return (r.right - r.left, r.bottom - r.top)
+    return (0, 0)
+
+
+def client_size(hwnd: int) -> tuple[int, int]:
+    """ขนาดพื้นที่เนื้อหา (ไม่รวมขอบ/title) — สะท้อนอัตราส่วนวิดีโอจริง"""
+    if not (_AVAILABLE and hwnd):
+        return (0, 0)
+    r = wintypes.RECT()
+    if _user32.GetClientRect(hwnd, ctypes.byref(r)):
+        return (r.right - r.left, r.bottom - r.top)
+    return (0, 0)

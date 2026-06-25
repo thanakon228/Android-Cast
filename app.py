@@ -363,6 +363,7 @@ class MainWindow(QWidget):
         self.supervisor: ConnectionSupervisor | None = None
         self.current_target: str | None = None   # อุปกรณ์ที่กำลังเชื่อมต่ออยู่
         self.embedded_hwnd: int = 0               # HWND ของ scrcpy ที่ฝังอยู่
+        self._embed_aspect: float = 0.0           # อัตราส่วน w/h ของจอมือถือ (จัด contain-fit)
 
         # console log bus (ส่ง log จาก adb/scrcpy/เธรดต่าง ๆ เข้าหน้าจอ)
         self.bus = LogBus()
@@ -985,6 +986,11 @@ class MainWindow(QWidget):
     def _on_embed_ready(self, hwnd: int):
         """เรียกบน main thread — ทำ SetParent ที่นี่ (thread เจ้าของ parent)"""
         parent = int(self.embed_area.winId())
+        # จับอัตราส่วนวิดีโอจริง "ก่อน" reparent (ตอนยังเป็นหน้าต่างปกติ)
+        cw, ch = win_embed.client_size(hwnd)
+        if not (cw and ch):
+            cw, ch = win_embed.window_size(hwnd)
+        self._embed_aspect = (cw / ch) if (cw and ch) else 0.0
         if win_embed.embed(hwnd, parent):
             self.embedded_hwnd = hwnd
             # ซ่อนแท็บเพื่อให้จอมือถือเต็มพื้นที่
@@ -1000,9 +1006,24 @@ class MainWindow(QWidget):
             self.embed_area.hide()
 
     def _resize_embedded(self):
-        if self.embedded_hwnd and self.embed_area.isVisible():
-            win_embed.resize(self.embedded_hwnd,
-                             self.embed_area.width(), self.embed_area.height())
+        if not (self.embedded_hwnd and self.embed_area.isVisible()):
+            return
+        aw, ah = self.embed_area.width(), self.embed_area.height()
+        ar = getattr(self, "_embed_aspect", 0.0)
+        if ar and ar > 0:
+            # จัดให้พอดีกรอบแบบรักษาสัดส่วน (contain) + จัดกึ่งกลาง
+            # → ไม่มีพื้นที่ว่างด้านล่าง (ใช้ความสูงเต็มสำหรับจอแนวตั้ง)
+            if aw / ah > ar:          # กรอบกว้างกว่าจอ → จำกัดด้วยความสูง
+                h = ah
+                w = int(round(ah * ar))
+            else:                     # กรอบสูงกว่าจอ → จำกัดด้วยความกว้าง
+                w = aw
+                h = int(round(aw / ar))
+            x = max(0, (aw - w) // 2)
+            y = max(0, (ah - h) // 2)
+            win_embed.place(self.embedded_hwnd, x, y, w, h)
+        else:
+            win_embed.resize(self.embedded_hwnd, aw, ah)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
