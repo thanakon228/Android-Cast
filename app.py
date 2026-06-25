@@ -43,6 +43,9 @@ ROOT = Path(__file__).resolve().parent
 RECORDINGS_DIR = ROOT / "recordings"
 SCREENSHOTS_DIR = ROOT / "screenshots"
 
+# ชื่อหน้าต่างคงที่สำหรับโหมดสตรีม (ให้ OBS เลือกเจอและล็อกได้แม้ reconnect)
+STREAM_TITLE = "AndroidCast - Live"
+
 # ค่าตั้งต้นของออปชัน scrcpy (ปรับได้ในแท็บ "ตั้งค่า")
 DEFAULT_OPTS = {
     "bitrate": "8M",
@@ -54,6 +57,7 @@ DEFAULT_OPTS = {
     "stay_awake": False,     # คาหน้าจอมือถือไม่ให้หลับ
     "always_on_top": False,  # หน้าต่างอยู่บนสุด
     "embed": False,          # ฝังหน้าจอในแอป (ทดลอง)
+    "stream_mode": False,    # โหมดสตรีม OBS: หน้าต่างแยก ชื่อคงที่ (OBS เลือกเจอ)
 }
 
 # พรีเซ็ตคุณภาพ
@@ -641,9 +645,15 @@ class MainWindow(QWidget):
         self.cb_stay_awake = QCheckBox("☕ คาหน้าจอมือถือไม่ให้หลับ (ลดอาการหลุด)")
         self.cb_aot = QCheckBox("📌 หน้าต่างอยู่บนสุดเสมอ (Always-on-top)")
         self.cb_embed = QCheckBox("🖼️ ฝังหน้าจอในแอป (ทดลอง — Windows เท่านั้น)")
+        self.cb_stream = QCheckBox("🎥 โหมดสตรีม OBS (หน้าต่างแยก ชื่อคงที่ — ให้ OBS เลือกเจอ)")
         for cb in (self.cb_record, self.cb_audio, self.cb_screen_off,
-                   self.cb_stay_awake, self.cb_aot, self.cb_embed):
+                   self.cb_stay_awake, self.cb_aot, self.cb_embed, self.cb_stream):
             lay.addWidget(cb)
+        # โหมดสตรีมกับฝังในแอป ใช้พร้อมกันไม่ได้ (ฝัง = ลูกในแอป, สตรีม = หน้าต่างแยก top-level)
+        self.cb_stream.toggled.connect(
+            lambda on: self.cb_embed.setChecked(False) if on else None)
+        self.cb_embed.toggled.connect(
+            lambda on: self.cb_stream.setChecked(False) if on else None)
         outer.addWidget(card)
 
         # ---- ปุ่มบันทึก / เปิดโฟลเดอร์ ----
@@ -713,6 +723,7 @@ class MainWindow(QWidget):
         self.cb_stay_awake.setChecked(o["stay_awake"])
         self.cb_aot.setChecked(o["always_on_top"])
         self.cb_embed.setChecked(o["embed"])
+        self.cb_stream.setChecked(o.get("stream_mode", False))
 
     def _apply_preset(self, name: str):
         p = PRESETS[name]
@@ -733,6 +744,7 @@ class MainWindow(QWidget):
             "stay_awake": self.cb_stay_awake.isChecked(),
             "always_on_top": self.cb_aot.isChecked(),
             "embed": self.cb_embed.isChecked(),
+            "stream_mode": self.cb_stream.isChecked(),
         }
 
     def _save_options(self):
@@ -917,10 +929,22 @@ class MainWindow(QWidget):
             self._log(f"🔴 อัดวิดีโอไว้ที่: {record_path}")
 
         extra = build_scrcpy_args(self.opts, record_path)
-        title = f"{APP_NAME} — {target}"
+
+        stream_mode = self.opts.get("stream_mode")
+        # โหมดสตรีมต้องเป็นหน้าต่างแยก top-level → ปิดการฝังอัตโนมัติ
+        embed_enabled = (self.opts.get("embed") and not stream_mode
+                         and win_embed.available())
+
+        if stream_mode:
+            # ชื่อคงที่ → OBS Window Capture เลือกเจอและล็อกไว้ได้แม้ reconnect
+            title = STREAM_TITLE
+            self._log(f"🎥 โหมดสตรีม OBS: เปิด Window Capture ใน OBS แล้วเลือกหน้าต่าง "
+                      f"\"{STREAM_TITLE}\"")
+        else:
+            title = f"{APP_NAME} — {target}"
 
         parent_hwnd = 0
-        if self.opts.get("embed") and win_embed.available():
+        if embed_enabled:
             self.embed_area.show()
             parent_hwnd = int(self.embed_area.winId())
 
