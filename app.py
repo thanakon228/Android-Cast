@@ -36,12 +36,20 @@ import qrcode
 import win_embed
 from scrcpy_manager import ScrcpyManager, ToolError, local_ip
 from settings_store import load_settings, save_settings
+from plugin_manager import PluginManager
 
 APP_NAME = "ScreenCast Studio"
 
 ROOT = Path(__file__).resolve().parent
-RECORDINGS_DIR = ROOT / "recordings"
-SCREENSHOTS_DIR = ROOT / "screenshots"
+# โฟลเดอร์ฐานสำหรับไฟล์ของผู้ใช้: ถ้า build เป็น .exe ให้อยู่ "ข้าง ๆ ตัว .exe"
+# (ไม่ใช่โฟลเดอร์ชั่วคราวของ PyInstaller) เพื่อให้วางปลั๊กอิน/หาไฟล์อัดได้
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = ROOT
+RECORDINGS_DIR = BASE_DIR / "recordings"
+SCREENSHOTS_DIR = BASE_DIR / "screenshots"
+PLUGINS_DIR = BASE_DIR / "plugins"         # โฟลเดอร์ปลั๊กอินบอท (โยนไฟล์ลงไปก็ใช้ได้)
 
 # ชื่อหน้าต่างคงที่สำหรับโหมดสตรีม (ให้ OBS เลือกเจอและล็อกได้แม้ reconnect)
 STREAM_TITLE = "AndroidCast - Live"
@@ -400,6 +408,16 @@ class MainWindow(QWidget):
         self._metrics_timer.setInterval(5000)
         self._metrics_timer.timeout.connect(self._poll_metrics)
 
+        # ระบบปลั๊กอินบอท
+        self.settings.setdefault("plugins", {})
+        self.plugin_mgr = PluginManager(
+            PLUGINS_DIR, self.mgr, logger=self.bus.line.emit,
+            config_store=self.settings["plugins"],
+            save_settings_cb=lambda: save_settings(self.settings),
+        )
+        self._loaded_plugins: list = []     # ผลจาก discover()
+        self._plugin_cards: dict = {}       # key -> dict(widgets)
+
         self.setObjectName("root")
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(QSize(560, 720))
@@ -451,8 +469,9 @@ class MainWindow(QWidget):
         tab_row.setSpacing(18)
         self.tab_wifi = QPushButton("📶  WiFi")
         self.tab_usb = QPushButton("🔌  USB")
+        self.tab_bots = QPushButton("🤖  บอท")
         self.tab_settings = QPushButton("⚙️  ตั้งค่า")
-        self._tabs = (self.tab_wifi, self.tab_usb, self.tab_settings)
+        self._tabs = (self.tab_wifi, self.tab_usb, self.tab_bots, self.tab_settings)
         for i, t in enumerate(self._tabs):
             t.setObjectName("tab")
             t.setCheckable(True)
@@ -467,6 +486,7 @@ class MainWindow(QWidget):
         self.stack = QStackedWidget()
         self.stack.addWidget(self._build_wifi_page())
         self.stack.addWidget(self._build_usb_page())
+        self.stack.addWidget(self._build_bots_page())
         self.stack.addWidget(self._build_settings_page())
         root.addWidget(self.stack, 1)
 
@@ -677,6 +697,193 @@ class MainWindow(QWidget):
 
         outer.addStretch(1)
         return page
+
+    # ------------------------------------------------------------- bots page
+    def _build_bots_page(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        page = QWidget()
+        scroll.setWidget(page)
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 8, 0, 0)
+        outer.setSpacing(14)
+
+        # หัวข้อ + ปุ่มจัดการ
+        card, lay = self._card()
+        lay.addWidget(self._h("🤖 บอท / ปลั๊กอิน"))
+        desc = QLabel(
+            "วางไฟล์ปลั๊กอิน (.py) ไว้ในโฟลเดอร์ <b>plugins/</b> แล้วกด "
+            "“โหลดปลั๊กอินใหม่” — บอทจะคุมมือถือผ่านเครื่องที่เชื่อมต่ออยู่")
+        desc.setObjectName("hint")
+        desc.setWordWrap(True)
+        lay.addWidget(desc)
+
+        warn = QLabel("⚠️ ปลั๊กอินคือโค้ดที่รันด้วยสิทธิ์เต็ม — ติดตั้งเฉพาะจากแหล่งที่เชื่อถือได้")
+        warn.setObjectName("hint")
+        warn.setWordWrap(True)
+        lay.addWidget(warn)
+
+        self.bots_device_lbl = QLabel("อุปกรณ์: —")
+        self.bots_device_lbl.setObjectName("hint")
+        lay.addWidget(self.bots_device_lbl)
+
+        row = QHBoxLayout()
+        btn_reload = QPushButton("🔄 โหลดปลั๊กอินใหม่")
+        btn_reload.setObjectName("ghost")
+        btn_reload.clicked.connect(self._refresh_plugins)
+        btn_folder = QPushButton("📂 เปิดโฟลเดอร์ปลั๊กอิน")
+        btn_folder.setObjectName("ghost")
+        btn_folder.clicked.connect(self._open_plugins_folder)
+        row.addWidget(btn_reload)
+        row.addWidget(btn_folder)
+        row.addStretch(1)
+        lay.addLayout(row)
+        outer.addWidget(card)
+
+        # รายการปลั๊กอิน (เติมโดย _refresh_plugins)
+        self._plugins_box = QVBoxLayout()
+        self._plugins_box.setSpacing(12)
+        outer.addLayout(self._plugins_box)
+
+        outer.addStretch(1)
+        self._refresh_plugins()
+        return scroll
+
+    def _refresh_plugins(self):
+        # เคลียร์การ์ดเดิม
+        while self._plugins_box.count():
+            item = self._plugins_box.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        self._plugin_cards.clear()
+
+        self._loaded_plugins = self.plugin_mgr.discover()
+        self._update_bots_device_label()
+
+        if not self._loaded_plugins:
+            empty = QLabel("ยังไม่มีปลั๊กอิน — วางไฟล์ .py ไว้ในโฟลเดอร์ plugins/ แล้วกดโหลดใหม่")
+            empty.setObjectName("hint")
+            empty.setWordWrap(True)
+            self._plugins_box.addWidget(empty)
+            return
+
+        for lp in self._loaded_plugins:
+            self._plugins_box.addWidget(self._make_plugin_card(lp))
+
+    def _make_plugin_card(self, lp) -> QWidget:
+        card, lay = self._card()
+        head = QHBoxLayout()
+        name = QLabel(f"{lp.meta.name}  <span style='color:#9aa0a6'>v{lp.meta.version}</span>")
+        name.setObjectName("sectionTitle")
+        head.addWidget(name)
+        head.addStretch(1)
+        status = QLabel("● พร้อม" if lp.ok else "● โหลดไม่สำเร็จ")
+        status.setObjectName("hint")
+        head.addWidget(status)
+        lay.addLayout(head)
+
+        if lp.meta.author:
+            by = QLabel(f"โดย {lp.meta.author}")
+            by.setObjectName("hint")
+            lay.addWidget(by)
+        if lp.meta.description:
+            d = QLabel(lp.meta.description)
+            d.setObjectName("hint")
+            d.setWordWrap(True)
+            lay.addWidget(d)
+
+        if not lp.ok:
+            err = QPlainTextEdit(lp.error)
+            err.setReadOnly(True)
+            err.setObjectName("console")
+            err.setFixedHeight(90)
+            lay.addWidget(err)
+        else:
+            btn = QPushButton("▶ เริ่มบอท")
+            btn.setObjectName("primary")
+            btn.clicked.connect(lambda _, k=lp.key: self._toggle_plugin(k))
+            lay.addWidget(btn)
+            self._plugin_cards[lp.key] = {"status": status, "btn": btn}
+
+        return card
+
+    def _active_device_serial(self) -> str:
+        """อุปกรณ์ที่บอทจะคุม: ใช้ตัวที่กำลังแคส ถ้าไม่มีก็ตัวแรกที่ต่ออยู่"""
+        if self.current_target:
+            return self.current_target
+        try:
+            for d in self.mgr.list_devices():
+                if d.state == "device":
+                    return d.serial
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+
+    def _update_bots_device_label(self):
+        serial = self._active_device_serial()
+        self.bots_device_lbl.setText(f"อุปกรณ์: {serial}" if serial
+                                     else "อุปกรณ์: — (ยังไม่ได้เชื่อมต่อมือถือ)")
+
+    def _toggle_plugin(self, key: str):
+        if self.plugin_mgr.is_running(key):
+            self._stop_plugin(key)
+        else:
+            self._start_plugin(key)
+
+    def _start_plugin(self, key: str):
+        lp = next((p for p in self._loaded_plugins if p.key == key), None)
+        if lp is None:
+            return
+        serial = self._active_device_serial()
+        if not serial:
+            self._toast("ยังไม่มีอุปกรณ์", "เชื่อมต่อมือถือก่อนถึงจะรันบอทได้",
+                        QMessageBox.Icon.Warning)
+            return
+        try:
+            runner = self.plugin_mgr.start(lp, serial)
+        except Exception as e:  # noqa: BLE001
+            self._toast("เริ่มบอทไม่ได้", str(e), QMessageBox.Icon.Warning)
+            return
+        runner.log_line.connect(self._log)
+        runner.state_changed.connect(self._on_plugin_state)
+        runner.start()
+        self._update_bots_device_label()
+
+    def _stop_plugin(self, key: str):
+        runner = self.plugin_mgr.runners.get(key)
+        if runner and runner.isRunning():
+            runner.request_stop()
+            card = self._plugin_cards.get(key)
+            if card:
+                card["status"].setText("● กำลังหยุด...")
+                card["btn"].setText("⏳ กำลังหยุด...")
+                card["btn"].setEnabled(False)
+
+    def _on_plugin_state(self, key: str, state: str):
+        card = self._plugin_cards.get(key)
+        if not card:
+            return
+        card["btn"].setEnabled(True)
+        if state == "running":
+            card["status"].setText("🟢 กำลังทำงาน")
+            card["btn"].setText("■ หยุดบอท")
+            card["btn"].setObjectName("stop")
+        else:
+            card["status"].setText("● พร้อม" if state == "stopped" else "🔴 ขัดข้อง")
+            card["btn"].setText("▶ เริ่มบอท")
+            card["btn"].setObjectName("primary")
+        # บังคับ refresh สไตล์หลังเปลี่ยน objectName
+        card["btn"].style().unpolish(card["btn"])
+        card["btn"].style().polish(card["btn"])
+
+    def _open_plugins_folder(self):
+        PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(str(PLUGINS_DIR))  # type: ignore[attr-defined]
+        except Exception as e:  # noqa: BLE001
+            self._toast("เปิดโฟลเดอร์ไม่ได้", str(e), QMessageBox.Icon.Warning)
 
     def _build_settings_page(self) -> QWidget:
         scroll = QScrollArea()
@@ -1261,6 +1468,7 @@ class MainWindow(QWidget):
         self.live_meta.setText("    ".join(parts) if parts else "—")
 
     def closeEvent(self, event):
+        self.plugin_mgr.stop_all()
         self._stop_session()
         event.accept()
 

@@ -1,0 +1,5 @@
+# ออปชันเสริมสำหรับปลั๊กอินบอทที่ใช้ computer vision / AI
+# ติดตั้งเมื่อจะใช้ ctx.vision (template matching) หรือ ctx.screencap_np()
+#   pip install -r requirements-bots.txt
+opencv-python
+numpy

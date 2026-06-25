@@ -370,6 +370,50 @@ class ScrcpyManager:
             pass
         return -1
 
+    # ------------------------------------------------ คุมมือถือ (สำหรับบอท/ปลั๊กอิน)
+    def screencap_bytes(self, serial: str) -> bytes:
+        """จับภาพหน้าจอเป็น PNG (bytes) — ไม่เขียนไฟล์ (เหมาะกับบอท/AI)"""
+        if not self.adb_path:
+            raise ToolError("ยังไม่มี adb")
+        cp = subprocess.run(
+            [str(self.adb_path), "-s", serial, "exec-out", "screencap", "-p"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+        if cp.returncode != 0 or not cp.stdout:
+            err = cp.stderr.decode("utf-8", "replace").strip() if cp.stderr else ""
+            raise ToolError(err or "จับภาพหน้าจอไม่สำเร็จ")
+        return cp.stdout
+
+    def screen_size(self, serial: str) -> tuple[int, int]:
+        """ความละเอียดหน้าจอมือถือ (กว้าง, สูง) — (0,0) ถ้าอ่านไม่ได้"""
+        try:
+            cp = self._adb("-s", serial, "shell", "wm", "size", timeout=8)
+            m = re.search(r"(\d+)\s*x\s*(\d+)", cp.stdout)
+            if m:
+                return (int(m.group(1)), int(m.group(2)))
+        except Exception:  # noqa: BLE001
+            pass
+        return (0, 0)
+
+    def input_tap(self, serial: str, x: int, y: int) -> None:
+        self._adb("-s", serial, "shell", "input", "tap", str(int(x)), str(int(y)), timeout=10)
+
+    def input_swipe(self, serial: str, x1: int, y1: int, x2: int, y2: int,
+                    duration_ms: int = 200) -> None:
+        self._adb("-s", serial, "shell", "input", "swipe",
+                  str(int(x1)), str(int(y1)), str(int(x2)), str(int(y2)),
+                  str(int(duration_ms)), timeout=10)
+
+    def input_keyevent(self, serial: str, keycode) -> None:
+        """ส่งปุ่ม (เลข keycode หรือชื่อ เช่น 'KEYCODE_HOME')"""
+        self._adb("-s", serial, "shell", "input", "keyevent", str(keycode), timeout=10)
+
+    def input_text(self, serial: str, text: str) -> None:
+        """พิมพ์ข้อความ (เว้นวรรคแทนด้วย %s ตามที่ adb ต้องการ)"""
+        self._adb("-s", serial, "shell", "input", "text",
+                  text.replace(" ", "%s"), timeout=10)
+
 
 # ------------------------------------------------------------------ helpers
 def local_ip() -> str:
